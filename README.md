@@ -112,6 +112,23 @@ Retry by explicit failed-file path:
 python3 s3_migration.py retry --failed-file ~/s3-migration/failed-keys/upload_dtcm-invoice.txt
 ```
 
+Retry all failed-key files in one shot:
+
+```bash
+python3 s3_migration.py retry --all-failed
+```
+
+Retry all and delete each failed-key file only when that file's retry run is fully successful:
+
+```bash
+python3 s3_migration.py retry --all-failed --delete-failed-file-on-success
+```
+
+Note on deletion behavior:
+
+- By default, retry does **not** delete failed-key files.
+- Deletion happens only if `--delete-failed-file-on-success` is passed.
+
 ## Tail Commands
 
 Master summary log:

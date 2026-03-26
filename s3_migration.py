@@ -54,7 +54,7 @@ FAILED_PATTERNS = (
 
 AWS_RETRY_ENV = {
     "AWS_RETRY_MODE": "adaptive",
-    "AWS_MAX_ATTEMPTS": "20",
+    "AWS_MAX_ATTEMPTS": "2",
 }
 
 
@@ -714,12 +714,16 @@ class RetryRunner:
         safe = sanitize_name(folder)
         return self.failed_keys_dir / f"upload_{safe}.txt"
 
-    def run(self, folder: Optional[str], failed_file: Optional[Path]) -> int:
-        failed_path = self._resolve_failed_file(folder, failed_file)
+    def _retry_from_failed_path(
+        self,
+        failed_path: Path,
+        folder_override: Optional[str] = None,
+        delete_failed_file_on_success: bool = False,
+    ) -> int:
         if not failed_path.exists():
             raise FileNotFoundError(f"Failed-keys file not found: {failed_path}")
 
-        resolved_folder = folder or self._extract_folder_from_failed_file(failed_path)
+        resolved_folder = folder_override or self._extract_folder_from_failed_file(failed_path)
         safe_folder = sanitize_name(resolved_folder)
         raw_log = self.workdir / f"retry_{safe_folder}.raw.log"
         summary_log = self.workdir / f"retry_{safe_folder}.summary.log"
@@ -782,7 +786,49 @@ class RetryRunner:
             summary_log,
             f"Retry finished folder={resolved_folder} success={successes} failed={failures}",
         )
-        return 0 if failures == 0 else 1
+        rc = 0 if failures == 0 else 1
+
+        # Keep failed-key files by default for audit/replay. Delete only when requested
+        # and only after a fully successful retry run for that specific file.
+        if rc == 0 and delete_failed_file_on_success:
+            try:
+                failed_path.unlink(missing_ok=True)
+                self._log(summary_log, f"Deleted failed-file after success: {failed_path}")
+            except OSError as exc:
+                self._log(summary_log, f"Could not delete failed-file {failed_path}: {exc}")
+        return rc
+
+    def run(
+        self,
+        folder: Optional[str],
+        failed_file: Optional[Path],
+        all_failed: bool,
+        delete_failed_file_on_success: bool,
+    ) -> int:
+        if all_failed:
+            files = sorted(self.failed_keys_dir.glob("upload_*.txt"))
+            if not files:
+                print(f"No failed-key files found in {self.failed_keys_dir}")
+                return 0
+            overall_rc = 0
+            for path in files:
+                if not path.exists() or path.stat().st_size == 0:
+                    continue
+                rc = self._retry_from_failed_path(
+                    failed_path=path,
+                    folder_override=None,
+                    delete_failed_file_on_success=delete_failed_file_on_success,
+                )
+                if rc != 0:
+                    overall_rc = 1
+            return overall_rc
+
+        failed_path = self._resolve_failed_file(folder, failed_file)
+        return self._retry_from_failed_path(
+            failed_path=failed_path,
+            folder_override=folder,
+            delete_failed_file_on_success=delete_failed_file_on_success,
+        )
 
 
 def launch_daemon(args: argparse.Namespace, workdir: Path) -> int:
@@ -848,6 +894,16 @@ def build_parser() -> argparse.ArgumentParser:
     retry_cmd = sub.add_parser("retry", help="Retry failed object keys")
     retry_cmd.add_argument("--folder", type=str, default=None)
     retry_cmd.add_argument("--failed-file", type=Path, default=None)
+    retry_cmd.add_argument(
+        "--all-failed",
+        action="store_true",
+        help="Retry all files matching ~/s3-migration/failed-keys/upload_*.txt",
+    )
+    retry_cmd.add_argument(
+        "--delete-failed-file-on-success",
+        action="store_true",
+        help="Delete each failed-key file only when its retry run fully succeeds",
+    )
     retry_cmd.add_argument("--workdir", type=Path, default=DEFAULT_WORKDIR)
     retry_cmd.add_argument(
         "--verbose-copy-stats",
@@ -862,8 +918,10 @@ def validate_args(args: argparse.Namespace) -> None:
         if args.max_parallel <= 0:
             raise ValueError("--max-parallel must be > 0")
     if args.command == "retry":
-        if not args.folder and not args.failed_file:
-            raise ValueError("retry requires --folder or --failed-file")
+        if args.all_failed and (args.folder or args.failed_file):
+            raise ValueError("retry --all-failed cannot be combined with --folder/--failed-file")
+        if not args.all_failed and not args.folder and not args.failed_file:
+            raise ValueError("retry requires --folder, --failed-file, or --all-failed")
 
 
 def main() -> int:
@@ -887,7 +945,12 @@ def main() -> int:
             workdir=args.workdir.expanduser(),
             quiet_mode=not args.verbose_copy_stats,
         )
-        return retry.run(folder=args.folder, failed_file=args.failed_file)
+        return retry.run(
+            folder=args.folder,
+            failed_file=args.failed_file,
+            all_failed=args.all_failed,
+            delete_failed_file_on_success=args.delete_failed_file_on_success,
+        )
 
     parser.print_help()
     return 2
