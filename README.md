@@ -118,6 +118,12 @@ Retry all failed-key files in one shot:
 python3 s3_migration.py retry --all-failed
 ```
 
+Run all retries in background:
+
+```bash
+python3 s3_migration.py retry --all-failed --daemon
+```
+
 Retry all and delete each failed-key file only when that file's retry run is fully successful:
 
 ```bash
@@ -141,6 +147,18 @@ Master error log:
 
 ```bash
 tail -f ~/s3-migration/master_parallel.errors.log
+```
+
+Retry summary log (all retry batches):
+
+```bash
+tail -f ~/s3-migration/retry_parallel.summary.log
+```
+
+Retry raw log (all retry AWS CLI output):
+
+```bash
+tail -f ~/s3-migration/retry_parallel.raw.log
 ```
 
 Per-folder summary log (example `dtcm-invoice`):

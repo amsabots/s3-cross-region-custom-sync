@@ -694,11 +694,16 @@ class RetryRunner:
         self.quiet_mode = quiet_mode
         self.failed_keys_dir = self.workdir / FAILED_KEYS_DIRNAME
         self.master_error_log = self.workdir / "master_parallel.errors.log"
+        self.retry_master_raw_log = self.workdir / "retry_parallel.raw.log"
+        self.retry_master_summary_log = self.workdir / "retry_parallel.summary.log"
 
     def _log(self, path: Path, line: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as fh:
             fh.write(f"[{now_local_human()}] {line}\n")
+
+    def _log_retry_master(self, line: str) -> None:
+        self._log(self.retry_master_summary_log, line)
 
     def _extract_folder_from_failed_file(self, failed_file: Path) -> str:
         stem = failed_file.stem
@@ -735,17 +740,23 @@ class RetryRunner:
         ]
         keys = sorted(set(keys))
         self._log(summary_log, f"Starting retry for folder={resolved_folder} keys={len(keys)}")
+        self._log_retry_master(
+            f"[{resolved_folder}] STARTING keys={len(keys)} failed_file={failed_path}"
+        )
 
         if not keys:
             self._log(summary_log, "No keys to retry (empty failed-file)")
+            self._log_retry_master(f"[{resolved_folder}] No keys to retry (empty failed-file)")
             return 0
 
         env = {**os.environ, **AWS_RETRY_ENV}
         successes = 0
         failures = 0
 
-        with raw_log.open("a", encoding="utf-8") as raw_fh:
-            for key in keys:
+        with raw_log.open("a", encoding="utf-8") as raw_fh, self.retry_master_raw_log.open(
+            "a", encoding="utf-8"
+        ) as master_raw_fh:
+            for idx, key in enumerate(keys, start=1):
                 cmd = [
                     "aws",
                     "s3",
@@ -759,8 +770,11 @@ class RetryRunner:
                 ]
                 if self.quiet_mode:
                     cmd.append("--only-show-errors")
-                raw_fh.write(f"[{now_local_human()}] [retry-command] {' '.join(cmd)}\n")
+                cmd_line = f"[{now_local_human()}] [retry-command] {' '.join(cmd)}\n"
+                raw_fh.write(cmd_line)
+                master_raw_fh.write(f"[{resolved_folder}] {cmd_line}")
                 raw_fh.flush()
+                master_raw_fh.flush()
                 proc = subprocess.run(
                     cmd,
                     capture_output=True,
@@ -769,8 +783,10 @@ class RetryRunner:
                 )
                 if proc.stdout:
                     raw_fh.write(proc.stdout)
+                    master_raw_fh.write(f"[{resolved_folder}] {proc.stdout}")
                 if proc.stderr:
                     raw_fh.write(proc.stderr)
+                    master_raw_fh.write(f"[{resolved_folder}] {proc.stderr}")
                 if proc.returncode == 0:
                     successes += 1
                 else:
@@ -780,11 +796,20 @@ class RetryRunner:
                             f"[{now_local_human()}] [retry-{resolved_folder}] cp failed "
                             f"key={key} exit_code={proc.returncode}\n"
                         )
+                if idx % 100 == 0 or idx == len(keys):
+                    self._log_retry_master(
+                        f"[{resolved_folder}] PROGRESS processed={idx}/{len(keys)} "
+                        f"success={successes} failed={failures}"
+                    )
                 raw_fh.flush()
+                master_raw_fh.flush()
 
         self._log(
             summary_log,
             f"Retry finished folder={resolved_folder} success={successes} failed={failures}",
+        )
+        self._log_retry_master(
+            f"[{resolved_folder}] FINISHED success={successes} failed={failures}"
         )
         rc = 0 if failures == 0 else 1
 
@@ -794,8 +819,14 @@ class RetryRunner:
             try:
                 failed_path.unlink(missing_ok=True)
                 self._log(summary_log, f"Deleted failed-file after success: {failed_path}")
+                self._log_retry_master(
+                    f"[{resolved_folder}] Deleted failed-file after success: {failed_path}"
+                )
             except OSError as exc:
                 self._log(summary_log, f"Could not delete failed-file {failed_path}: {exc}")
+                self._log_retry_master(
+                    f"[{resolved_folder}] Could not delete failed-file {failed_path}: {exc}"
+                )
         return rc
 
     def run(
@@ -811,6 +842,9 @@ class RetryRunner:
                 print(f"No failed-key files found in {self.failed_keys_dir}")
                 return 0
             overall_rc = 0
+            self._log_retry_master(
+                f"Starting --all-failed retry scan files={len(files)} quiet_mode={self.quiet_mode}"
+            )
             for path in files:
                 if not path.exists() or path.stat().st_size == 0:
                     continue
@@ -821,6 +855,7 @@ class RetryRunner:
                 )
                 if rc != 0:
                     overall_rc = 1
+            self._log_retry_master(f"Finished --all-failed retry overall_rc={overall_rc}")
             return overall_rc
 
         failed_path = self._resolve_failed_file(folder, failed_file)
@@ -872,6 +907,54 @@ def launch_daemon(args: argparse.Namespace, workdir: Path) -> int:
     return 0
 
 
+def launch_retry_daemon(args: argparse.Namespace, workdir: Path) -> int:
+    workdir.mkdir(parents=True, exist_ok=True)
+    retry_master_raw = workdir / "retry_parallel.raw.log"
+    retry_master_summary = workdir / "retry_parallel.summary.log"
+
+    cmd = [sys.executable, str(Path(__file__).resolve()), "retry"]
+    cmd.extend(["--workdir", str(workdir)])
+    if args.folder:
+        cmd.extend(["--folder", args.folder])
+    if args.failed_file:
+        cmd.extend(["--failed-file", str(args.failed_file.expanduser())])
+    if args.all_failed:
+        cmd.append("--all-failed")
+    if args.delete_failed_file_on_success:
+        cmd.append("--delete-failed-file-on-success")
+    if args.verbose_copy_stats:
+        cmd.append("--verbose-copy-stats")
+
+    env = {**os.environ, "S3_MIGRATION_RETRY_DAEMON": "1"}
+    with retry_master_raw.open("a", encoding="utf-8") as raw_fh:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=raw_fh,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            env=env,
+        )
+
+    retry_state = {
+        "workdir": str(workdir),
+        "pid": os.getpid(),
+        "daemon_pid": proc.pid,
+        "started_at": now_utc_iso(),
+        "mode": "retry-daemon-bootstrap",
+        "command": cmd,
+    }
+    safe_write_json(workdir / "retry_parallel.state.json", retry_state)
+    with retry_master_summary.open("a", encoding="utf-8") as fh:
+        fh.write(
+            f"[{now_local_human()}] Daemon started pid={proc.pid} command={' '.join(cmd)}\n"
+        )
+
+    print(f"Retry daemon started. PID={proc.pid}")
+    print(f"Retry summary log: {retry_master_summary}")
+    print(f"Retry raw log: {retry_master_raw}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="S3 migration orchestrator")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -905,6 +988,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Delete each failed-key file only when its retry run fully succeeds",
     )
     retry_cmd.add_argument("--workdir", type=Path, default=DEFAULT_WORKDIR)
+    retry_cmd.add_argument("--daemon", action="store_true", help="Run retry in background mode")
     retry_cmd.add_argument(
         "--verbose-copy-stats",
         action="store_true",
@@ -941,6 +1025,8 @@ def main() -> int:
         return orchestrator.run()
 
     if args.command == "retry":
+        if args.daemon and os.getenv("S3_MIGRATION_RETRY_DAEMON") != "1":
+            return launch_retry_daemon(args, args.workdir.expanduser())
         retry = RetryRunner(
             workdir=args.workdir.expanduser(),
             quiet_mode=not args.verbose_copy_stats,
