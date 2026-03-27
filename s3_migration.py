@@ -185,12 +185,14 @@ class MigrationOrchestrator:
         max_parallel: int,
         quiet_mode: bool,
         skip_successful: bool,
+        skip_folders: Optional[Set[str]] = None,
     ) -> None:
         self.workdir = workdir
         self.failed_keys_dir = self.workdir / FAILED_KEYS_DIRNAME
         self.max_parallel = max_parallel
         self.quiet_mode = quiet_mode
         self.skip_successful = skip_successful
+        self.skip_folders = skip_folders or set()
         self.master_raw_log = self.workdir / "master_parallel.raw.log"
         self.master_summary_log = self.workdir / "master_parallel.summary.log"
         self.master_error_log = self.workdir / "master_parallel.errors.log"
@@ -355,9 +357,14 @@ class MigrationOrchestrator:
                 maybe = maybe[:-1]
             if not maybe or maybe == "_tmp":
                 continue
+            if maybe in self.skip_folders:
+                continue
             prefixes.append(maybe)
         prefixes = sorted(set(prefixes))
-        self.log_master(f"Discovered {len(prefixes)} upload folders (excluding _tmp)")
+        skipped_display = ", ".join(sorted(self.skip_folders)) if self.skip_folders else "none"
+        self.log_master(
+            f"Discovered {len(prefixes)} upload folders (excluding _tmp, skipped: {skipped_display})"
+        )
         return prefixes
 
     def build_jobs(self, upload_folders: Sequence[str]) -> Tuple[List[Job], List[Job]]:
@@ -647,9 +654,10 @@ class MigrationOrchestrator:
             self.write_master_state()
 
             self.log_master("Starting S3 migration orchestrator")
+            skip_folders_display = ", ".join(sorted(self.skip_folders)) if self.skip_folders else "none"
             self.log_master(
                 f"Config max_parallel={self.max_parallel} quiet_mode={self.quiet_mode} "
-                f"skip_successful={self.skip_successful}"
+                f"skip_successful={self.skip_successful} skip_folders=[{skip_folders_display}]"
             )
 
             upload_folders = self.discover_upload_folders()
@@ -876,6 +884,8 @@ def launch_daemon(args: argparse.Namespace, workdir: Path) -> int:
         cmd.append("--verbose-copy-stats")
     if args.skip_successful:
         cmd.append("--skip-successful")
+    if args.skip_folders:
+        cmd.extend(["--skip-folders"] + args.skip_folders)
 
     env = {**os.environ, "S3_MIGRATION_DAEMON": "1"}
     with master_raw.open("a", encoding="utf-8") as raw_fh:
@@ -973,6 +983,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip jobs whose existing state file records SUCCESS",
     )
     run_cmd.add_argument("--daemon", action="store_true", help="Run in background mode")
+    run_cmd.add_argument(
+        "--skip-folders",
+        nargs="+",
+        default=[],
+        metavar="FOLDER",
+        help="Upload folder names to skip (e.g. --skip-folders users event video)",
+    )
 
     retry_cmd = sub.add_parser("retry", help="Retry failed object keys")
     retry_cmd.add_argument("--folder", type=str, default=None)
@@ -1021,6 +1038,7 @@ def main() -> int:
             max_parallel=args.max_parallel,
             quiet_mode=not args.verbose_copy_stats,
             skip_successful=args.skip_successful,
+            skip_folders=set(args.skip_folders) if args.skip_folders else None,
         )
         return orchestrator.run()
 
