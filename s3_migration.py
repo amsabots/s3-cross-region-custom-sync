@@ -15,6 +15,7 @@ Design highlights:
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import json
 import logging
 import os
@@ -54,7 +55,7 @@ FAILED_PATTERNS = (
 
 AWS_RETRY_ENV = {
     "AWS_RETRY_MODE": "adaptive",
-    "AWS_MAX_ATTEMPTS": "2",
+    "AWS_MAX_ATTEMPTS": "1",
 }
 
 
@@ -186,6 +187,7 @@ class MigrationOrchestrator:
         quiet_mode: bool,
         skip_successful: bool,
         skip_folders: Optional[Set[str]] = None,
+        allow_concurrent_run: bool = False,
     ) -> None:
         self.workdir = workdir
         self.failed_keys_dir = self.workdir / FAILED_KEYS_DIRNAME
@@ -193,6 +195,7 @@ class MigrationOrchestrator:
         self.quiet_mode = quiet_mode
         self.skip_successful = skip_successful
         self.skip_folders = skip_folders or set()
+        self.allow_concurrent_run = allow_concurrent_run
         self.master_raw_log = self.workdir / "master_parallel.raw.log"
         self.master_summary_log = self.workdir / "master_parallel.summary.log"
         self.master_error_log = self.workdir / "master_parallel.errors.log"
@@ -648,16 +651,23 @@ class MigrationOrchestrator:
         }
 
     def run(self) -> int:
-        with LockedRunGuard(self.lock_path):
+        run_guard = nullcontext() if self.allow_concurrent_run else LockedRunGuard(self.lock_path)
+        with run_guard:
             self._master_state["pid"] = os.getpid()
             self._master_state["started_at"] = now_utc_iso()
             self.write_master_state()
 
             self.log_master("Starting S3 migration orchestrator")
             skip_folders_display = ", ".join(sorted(self.skip_folders)) if self.skip_folders else "none"
+            if self.allow_concurrent_run:
+                self.log_master(
+                    "allow_concurrent_run=True: master lock disabled for this run; "
+                    "use only with --skip-folders to avoid overlapping same prefixes"
+                )
             self.log_master(
                 f"Config max_parallel={self.max_parallel} quiet_mode={self.quiet_mode} "
-                f"skip_successful={self.skip_successful} skip_folders=[{skip_folders_display}]"
+                f"skip_successful={self.skip_successful} skip_folders=[{skip_folders_display}] "
+                f"allow_concurrent_run={self.allow_concurrent_run}"
             )
 
             upload_folders = self.discover_upload_folders()
@@ -886,6 +896,8 @@ def launch_daemon(args: argparse.Namespace, workdir: Path) -> int:
         cmd.append("--skip-successful")
     if args.skip_folders:
         cmd.extend(["--skip-folders"] + args.skip_folders)
+    if args.allow_concurrent_run:
+        cmd.append("--allow-concurrent-run")
 
     env = {**os.environ, "S3_MIGRATION_DAEMON": "1"}
     with master_raw.open("a", encoding="utf-8") as raw_fh:
@@ -990,6 +1002,11 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="FOLDER",
         help="Upload folder names to skip (e.g. --skip-folders users event video)",
     )
+    run_cmd.add_argument(
+        "--allow-concurrent-run",
+        action="store_true",
+        help="Disable master run lock to allow another run in parallel (use with --skip-folders)",
+    )
 
     retry_cmd = sub.add_parser("retry", help="Retry failed object keys")
     retry_cmd.add_argument("--folder", type=str, default=None)
@@ -1018,6 +1035,8 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.command == "run":
         if args.max_parallel <= 0:
             raise ValueError("--max-parallel must be > 0")
+        if args.allow_concurrent_run and not args.skip_folders:
+            raise ValueError("--allow-concurrent-run requires --skip-folders to reduce overlap risk")
     if args.command == "retry":
         if args.all_failed and (args.folder or args.failed_file):
             raise ValueError("retry --all-failed cannot be combined with --folder/--failed-file")
@@ -1039,6 +1058,7 @@ def main() -> int:
             quiet_mode=not args.verbose_copy_stats,
             skip_successful=args.skip_successful,
             skip_folders=set(args.skip_folders) if args.skip_folders else None,
+            allow_concurrent_run=args.allow_concurrent_run,
         )
         return orchestrator.run()
 

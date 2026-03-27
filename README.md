@@ -88,6 +88,13 @@ python3 s3_migration.py run --max-parallel 5
 python3 s3_migration.py run --max-parallel 5 --daemon
 ```
 
+If one long-running folder (for example `users`) is still syncing in another process,
+you can run a second pass for all other folders by skipping it and allowing concurrent run:
+
+```bash
+python3 s3_migration.py run --max-parallel 15 --daemon --skip-folders users --allow-concurrent-run
+```
+
 ```bash
 python3 s3_migration.py run --max-parallel 5 --verbose-copy-stats
 ```
