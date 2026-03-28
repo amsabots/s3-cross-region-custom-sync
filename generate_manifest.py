@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import argparse
 import logging
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -18,6 +20,8 @@ SOURCE_REGION = "me-south-1"
 MANIFEST_FINAL_PATH = Path("manifest.csv")
 MANIFEST_TEMP_PATH = Path("manifest.csv.tmp")
 LOG_PATH = Path("generate_manifest.log")
+STDOUT_LOG_PATH = Path("manifest.stdout.log")
+STATE_PATH = Path("generate_manifest.state.json")
 
 PROGRESS_EVERY = 10_000
 FLUSH_EVERY = 10_000
@@ -119,6 +123,41 @@ def generate_manifest(logger: logging.Logger) -> int:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description="Generate S3 Batch manifest CSV")
+    parser.add_argument(
+        "--daemon",
+        action="store_true",
+        help="Run in background mode and return immediately",
+    )
+    args = parser.parse_args()
+
+    if args.daemon and os.getenv("GENERATE_MANIFEST_DAEMON") != "1":
+        stdout_log = STDOUT_LOG_PATH.open("a", encoding="utf-8")
+        cmd = [sys.executable, str(Path(__file__).resolve())]
+        env = {**os.environ, "GENERATE_MANIFEST_DAEMON": "1"}
+        proc = subprocess.Popen(
+            cmd,
+            stdout=stdout_log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            env=env,
+        )
+        stdout_log.close()
+        STATE_PATH.write_text(
+            (
+                "{\n"
+                f'  "daemon_pid": {proc.pid},\n'
+                f'  "stdout_log": "{STDOUT_LOG_PATH.resolve()}",\n'
+                f'  "app_log": "{LOG_PATH.resolve()}"\n'
+                "}\n"
+            ),
+            encoding="utf-8",
+        )
+        print(f"Manifest daemon started. PID={proc.pid}")
+        print(f"Stdout log: {STDOUT_LOG_PATH.resolve()}")
+        print(f"App log: {LOG_PATH.resolve()}")
+        return 0
+
     logger = setup_logging()
     logger.info("Script start")
     return generate_manifest(logger)
